@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 4534
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:4534", "app:app"]
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:4534", "main:app"]
