@@ -428,8 +428,9 @@ def ping():
         }
     })
 
-if __name__ == '__main__':
-    print("=== Navidrome-Deezer Proxy ===")
-    print(f"Navidrome: {NAVIDROME_URL}")
-    print("===============================")
-    app.run(host='0.0.0.0', port=4534, debug=False, threaded=True)
+#if __name__ == '__main__':
+#    print("=== Navidrome-Deezer Proxy ===")
+#    print(f"Navidrome: {NAVIDROME_URL}")
+#    print("===============================")
+#    app.run(host='0.0.0.0', port=4534, debug=False, threaded=True)
+
