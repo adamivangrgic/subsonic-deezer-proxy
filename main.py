@@ -8,7 +8,6 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response, JSONResponse, StreamingResponse
 import httpx
 import asyncio
-from urllib.parse import urlencode
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -22,12 +21,9 @@ DEEZER_ARL = os.getenv("DEEZER_ARL")
 DEEMIX_URL = os.getenv("DEEMIX_URL")
 DEEZER_API_URL = "https://api.deezer.com"
 
-# Cache and async HTTP client
+# Cache
 search_cache: Dict[str, Any] = {}
 CACHE_TIMEOUT = 300
-
-# Async HTTP client with connection pooling
-client = httpx.AsyncClient(timeout=30.0)
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def catch_all(path: str, request: Request):
@@ -86,48 +82,66 @@ async def proxy_to_navidrome(path: str, request: Request):
     # Forward request body if present
     body = await request.body() if request.method in ["POST", "PUT"] else None
     
-    response = await client.request(
-        method=request.method,
-        url=url,
-        params=dict(request.query_params),
-        headers={k: v for k, v in request.headers.items() if k.lower() != 'host'},
-        content=body
-    )
-    
-    return Response(
-        content=await response.aread(),
-        status_code=response.status_code,
-        headers=dict(response.headers)
-    )
-
-async def handle_search_request(path: str, request: Request):
-    """Handle search requests and merge Deezer results - ASYNC VERSION"""
-    try:
-        # Run Navidrome and Deezer searches concurrently
-        navidrome_task = proxy_to_navidrome(path, request)
-        deezer_task = get_deezer_results(request.query_params.get('query'))
-        
-        navidrome_response, deezer_results = await asyncio.gather(
-            navidrome_task, deezer_task, return_exceptions=True
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.request(
+            method=request.method,
+            url=url,
+            params=dict(request.query_params),
+            headers={k: v for k, v in request.headers.items() if k.lower() != 'host'},
+            content=body
         )
         
-        # Handle exceptions
-        if isinstance(navidrome_response, Exception):
-            raise navidrome_response
-        if isinstance(deezer_results, Exception):
-            deezer_results = {"song": []}
+        # For streaming responses, handle differently
+        if 'stream' in path or 'download' in path:
+            return StreamingResponse(
+                response.aiter_bytes(),
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.headers.get('content-type', 'audio/mpeg')
+            )
+        else:
+            return Response(
+                content=await response.aread(),
+                status_code=response.status_code,
+                headers=dict(response.headers)
+            )
+
+async def handle_search_request(path: str, request: Request):
+    """Handle search requests and merge Deezer results"""
+    try:
+        # Get Navidrome response first
+        navidrome_response = await proxy_to_navidrome(path, request)
         
-        # If Navidrome response is not JSON, return as-is
-        if not isinstance(navidrome_response, JSONResponse):
+        # If it's not a JSON response (error, etc.), return as-is
+        if not hasattr(navidrome_response, 'body'):
+            return navidrome_response
+            
+        # Extract JSON content from response
+        navidrome_content = b''
+        if hasattr(navidrome_response, 'body'):
+            if hasattr(navidrome_response.body, '__await__'):
+                navidrome_content = await navidrome_response.body
+            else:
+                navidrome_content = navidrome_response.body
+        
+        try:
+            navidrome_data = json.loads(navidrome_content)
+        except json.JSONDecodeError:
+            # If not JSON, return original response
             return navidrome_response
         
-        navidrome_data = await get_json_from_response(navidrome_response)
+        query = request.query_params.get('query')
+        if not query:
+            return navidrome_response
+        
+        # Get Deezer results
+        deezer_results = await get_deezer_results(query)
         
         if deezer_results.get('song'):
             merged_data = merge_search_results(navidrome_data, deezer_results)
             
             # Cache the results
-            cache_key = f"search_{request.query_params.get('query')}"
+            cache_key = f"search_{query}"
             search_cache[cache_key] = (merged_data, time.time())
             
             return JSONResponse(merged_data)
@@ -138,21 +152,15 @@ async def handle_search_request(path: str, request: Request):
         logger.error(f"Search error: {e}")
         return await proxy_to_navidrome(path, request)
 
-async def get_json_from_response(response: Response):
-    """Extract JSON from response"""
-    content = await response.body()
-    return json.loads(content)
-
 async def get_deezer_results(query: str):
-    """Search Deezer for tracks - ASYNC VERSION"""
+    """Search Deezer for tracks"""
     try:
         logger.info(f"Searching Deezer for: {query}")
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.get(
                 f"{DEEZER_API_URL}/search",
-                params={'q': query, 'limit': 250},
-                timeout=8.0
+                params={'q': query, 'limit': 250}
             )
             
             if response.status_code != 200:
@@ -235,7 +243,7 @@ def merge_search_results(navidrome_data, deezer_data):
     return result
 
 async def get_deezer_cover_art(album_id: str):
-    """Get cover art from Deezer - ASYNC VERSION"""
+    """Get cover art from Deezer"""
     try:
         cache_key = f"cover_{album_id}"
         if cache_key in search_cache:
@@ -243,16 +251,16 @@ async def get_deezer_cover_art(album_id: str):
             if time.time() - cache_time < CACHE_TIMEOUT:
                 return Response(cached_data, media_type='image/jpeg')
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             album_url = f"https://api.deezer.com/album/{album_id}"
-            response = await client.get(album_url, timeout=5.0)
+            response = await client.get(album_url)
             
             if response.status_code == 200:
                 album_data = response.json()
                 cover_url = album_data.get('cover_xl') or album_data.get('cover_big')
                 
                 if cover_url:
-                    img_response = await client.get(cover_url, timeout=5.0)
+                    img_response = await client.get(cover_url)
                     
                     if img_response.status_code == 200:
                         img_data = img_response.content
@@ -264,31 +272,29 @@ async def get_deezer_cover_art(album_id: str):
                             headers={'Cache-Control': 'public, max-age=86400'}
                         )
         
-        return await return_default_cover()
+        return JSONResponse({
+            "subsonic-response": {
+                "status": "failed",
+                "version": "1.16.1",
+                "error": {
+                    "code": 70,
+                    "message": "Cover art not found"
+                }
+            }
+        }, status_code=404)
         
     except Exception as e:
         logger.error(f"Cover art error: {e}")
-        return await return_default_cover()
-
-async def return_default_cover():
-    return JSONResponse({
-        "subsonic-response": {
-            "status": "failed",
-            "version": "1.16.1",
-            "error": {
-                "code": 70,
-                "message": "Cover art not found"
-            }
-        }
-    }, status_code=404)
+        return JSONResponse({"error": "Cover art not found"}, status_code=404)
 
 async def stream_deezer_track(track_id: str):
-    """Stream Deezer track - ASYNC VERSION"""
+    """Stream Deezer track - FIXED VERSION"""
     try:
         deezer_id = track_id.replace('deezer_', '')
         
-        async with httpx.AsyncClient() as client:
-            track_info = await client.get(f"https://api.deezer.com/track/{deezer_id}", timeout=5.0)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Get track info
+            track_info = await client.get(f"https://api.deezer.com/track/{deezer_id}")
             
             if track_info.status_code != 200:
                 return JSONResponse({"error": "Track not found"}, status_code=404)
@@ -297,24 +303,27 @@ async def stream_deezer_track(track_id: str):
             preview_url = track_data.get('preview')
             
             if preview_url:
-                # Stream the audio directly
-                return StreamingResponse(
-                    client.stream("GET", preview_url),
-                    media_type="audio/mpeg",
-                    headers={
-                        'Accept-Ranges': 'bytes',
-                        'Cache-Control': 'no-cache'
-                    }
-                )
-            else:
-                return JSONResponse({"error": "No preview available"}, status_code=500)
+                # Get the audio data directly
+                audio_response = await client.get(preview_url)
+                
+                if audio_response.status_code == 200:
+                    return Response(
+                        content=audio_response.content,
+                        media_type="audio/mpeg",
+                        headers={
+                            'Accept-Ranges': 'bytes',
+                            'Cache-Control': 'no-cache'
+                        }
+                    )
+            
+            return JSONResponse({"error": "No preview available"}, status_code=500)
             
     except Exception as e:
         logger.error(f"Streaming error: {e}")
         return JSONResponse({"error": f"Streaming failed: {str(e)}"}, status_code=500)
 
 async def trigger_deezer_download(track_id: str):
-    """Trigger download in deemix when user 'loves' a Deezer track - ASYNC VERSION"""
+    """Trigger download in deemix when user 'loves' a Deezer track"""
     try:
         deezer_id = track_id.replace('deezer_', '')
         
@@ -341,30 +350,24 @@ async def trigger_deezer_download(track_id: str):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0',
         }
         
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
                 f"{DEEMIX_URL}/api/addToQueue",
                 json=download_payload,
-                headers=headers,
-                timeout=10.0
+                headers=headers
             )
             
             if response.status_code in [200, 201]:
                 logger.info(f"Successfully queued Deezer track {deezer_id} for download")
-                return JSONResponse({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "version": "1.16.1"
-                    }
-                })
             else:
                 logger.error(f"Deemix API error: {response.status_code} - {response.text}")
-                return JSONResponse({
-                    "subsonic-response": {
-                        "status": "ok",
-                        "version": "1.16.1"
-                    }
-                })
+            
+            return JSONResponse({
+                "subsonic-response": {
+                    "status": "ok",
+                    "version": "1.16.1"
+                }
+            })
             
     except Exception as e:
         logger.error(f"Download trigger error: {e}")
@@ -376,7 +379,7 @@ async def trigger_deezer_download(track_id: str):
         })
 
 async def get_deemix_session():
-    """Get deemix session cookie by logging in with ARL - ASYNC VERSION"""
+    """Get deemix session cookie by logging in with ARL"""
     try:
         login_url = f"{DEEMIX_URL}/api/loginArl"
         login_payload = {
@@ -392,13 +395,8 @@ async def get_deemix_session():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0'
         }
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                login_url,
-                json=login_payload,
-                headers=headers,
-                timeout=10.0
-            )
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(login_url, json=login_payload, headers=headers)
             
             if response.status_code == 200:
                 # Extract cookies from response
@@ -433,4 +431,4 @@ if __name__ == '__main__':
     print("=== Navidrome-Deezer Proxy (FastAPI) ===")
     print(f"Navidrome: {NAVIDROME_URL}")
     print("=========================================")
-    uvicorn.run(app, host='0.0.0.0', port=4534, workers=1)
+    uvicorn.run(app, host='0.0.0.0', port=4534)
