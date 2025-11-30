@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 4534
-CMD ["gunicorn", "-k", "gevent", "--worker-connections", "1000", "-w", "4", "--bind", "0.0.0.0:4534", "main:app"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "4534", "--workers", "2"]
